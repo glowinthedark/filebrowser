@@ -1,0 +1,208 @@
+name: build-n-release
+
+on:
+  push:
+    branches:
+      - "master"
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+env:
+  MODULE_PATH: github.com/filebrowser/filebrowser/v2
+
+jobs:
+  lint-frontend:
+    name: Lint Frontend
+    runs-on: ubuntu-latest
+    if: false
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: "frontend/package.json"
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24.x"
+          cache: "pnpm"
+          cache-dependency-path: "frontend/pnpm-lock.yaml"
+      - working-directory: frontend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run lint
+
+  test-frontend:
+    name: Test Frontend
+    runs-on: ubuntu-latest
+    if: false
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: "frontend/package.json"
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24.x"
+          cache: "pnpm"
+          cache-dependency-path: "frontend/pnpm-lock.yaml"
+      - working-directory: frontend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run test
+
+  lint-backend:
+    name: Lint Backend
+    runs-on: ubuntu-latest
+    if: false
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.x"
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: "latest"
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    if: false
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.x"
+      - run: go test --race ./...
+
+  build:
+    name: Build (sanity check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.x"
+      - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: "frontend/package.json"
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24.x"
+          cache: "pnpm"
+          cache-dependency-path: "frontend/pnpm-lock.yaml"
+      - uses: go-task/setup-task@v2
+      - run: task build
+
+
+  prepare-release-frontend:
+    name: Build Frontend Assets (once)
+    needs: [build]
+    # needs: [lint-frontend, lint-backend, test, build]
+    # if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: "frontend/package.json"
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24.x"
+          cache: "pnpm"
+          cache-dependency-path: "frontend/pnpm-lock.yaml"
+      - uses: go-task/setup-task@v2
+      - run: task build:frontend
+      - name: Snapshot workspace (source + embedded assets + .git)
+        run: tar --exclude='frontend/node_modules' -czf /tmp/workspace.tar.gz .
+      - uses: actions/upload-artifact@v7
+        with:
+          name: workspace-snapshot
+          path: /tmp/workspace.tar.gz
+          retention-days: 1
+
+  build-release-binaries:
+    name: Cross-compile ${{ matrix.label }}
+    needs: prepare-release-frontend
+    # if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux,   goarch: amd64, label: linux-amd64 }
+          - { goos: linux,   goarch: arm64, label: linux-arm64 }
+          # armhf = Debian's ARMv7 hard-float baseline. Add a GOARM: "6"
+          # leg alongside this if you need Pi Zero/1 (ARMv6) too.
+          - { goos: linux,   goarch: arm,   goarm: "7", label: linux-armhf }
+          - { goos: darwin,  goarch: amd64, label: macos-amd64 }
+          - { goos: darwin,  goarch: arm64, label: macos-arm64 }
+          - { goos: windows, goarch: amd64, label: windows-amd64, ext: ".exe" }
+    steps:
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.x"
+      - uses: actions/download-artifact@v8
+        with:
+          name: workspace-snapshot
+          path: /tmp
+      - name: Restore workspace
+        run: tar -xzf /tmp/workspace.tar.gz
+
+      - name: Cross-compile binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: 0
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          SHA="$(git rev-parse --short HEAD)"
+          go build -trimpath \
+            -ldflags "-s -w -X ${MODULE_PATH}/version.Version=${VERSION} -X ${MODULE_PATH}/version.CommitSHA=${SHA}" \
+            -o "dist/filebrowser${{ matrix.ext }}" .
+
+      - name: Package archive
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          NAME="filebrowser_${GITHUB_REF_NAME}_${{ matrix.label }}"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            zip "${NAME}.zip" filebrowser.exe && rm filebrowser.exe
+          else
+            tar -czf "${NAME}.tar.gz" filebrowser && rm filebrowser
+          fi
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.label }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Release
+    needs: build-release-binaries
+    # if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dist/*
